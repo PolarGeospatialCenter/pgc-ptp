@@ -224,7 +224,7 @@ func addPolicyRules(veth *net.Interface, ipc *current.IPConfig, routes []*types.
 	return nil
 }
 
-func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, hostAddrs []netlink.Addr, masq, containerIPV4, containerIPV6 bool, k8sIfName string, pr *current.Result) (*current.Interface, *current.Interface, error) {
+func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, hostAddrs []netlink.Addr, additionalRoutes []*net.IPNet, masq, containerIPV4, containerIPV6 bool, k8sIfName string, pr *current.Result) (*current.Interface, *current.Interface, error) {
 	hostInterface := &current.Interface{}
 	containerInterface := &current.Interface{}
 
@@ -295,6 +295,8 @@ func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, hostAddrs []netl
 
 		_, linkLocalNet, _ := net.ParseCIDR("fe80::/8")
 
+		routes := make([]*netlink.Route, 0, len(hostAddrs)+len(additionalRoutes))
+
 		// add host routes for each dst hostInterface ip on dev contVeth
 		for _, ipc := range hostAddrs {
 			addrBits := 128
@@ -320,10 +322,30 @@ func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, hostAddrs []netl
 				route.Gw = hostLinkLocal[0].IP
 			}
 
+			routes = append(routes, route)
+		}
+
+		for _, subnet := range additionalRoutes {
+			route := &netlink.Route{
+				LinkIndex: contVeth.Index,
+				Scope:     netlink.SCOPE_LINK,
+				Dst:       subnet,
+			}
+
+			// If ipv6 route, use host link local address as gateway
+			if subnet.IP.To4() == nil && len(hostLinkLocal) > 0 {
+				route.Gw = hostLinkLocal[0].IP
+			}
+
+			routes = append(routes, route)
+
+		}
+
+		for _, route := range routes {
 			err := netlink.RouteAdd(route)
 
 			if err != nil {
-				return fmt.Errorf("failed to add host route dst %v: %v", ipc.IP, err)
+				return fmt.Errorf("failed to add host route dst %v: %v", route.Dst, err)
 			}
 		}
 
@@ -476,8 +498,17 @@ func cmdAdd(args *skel.CmdArgs) error {
 		}
 	}
 
+	additionalRoutes := make([]*net.IPNet, 0, len(conf.AdditionalRoutes))
+	for _, cidrString := range conf.AdditionalRoutes {
+		_, subnet, err := net.ParseCIDR(cidrString)
+		if err != nil {
+			return fmt.Errorf("failed to parse additional route %s: %v", cidrString, err)
+		}
+		additionalRoutes = append(additionalRoutes, subnet)
+	}
+
 	hostInterface, containerInterface, err := setupContainerVeth(netns, conf.ContainerInterface, conf.MTU,
-		hostAddrs, conf.IPMasq, containerIPV4, containerIPV6, args.IfName, conf.PrevResult)
+		hostAddrs, additionalRoutes, conf.IPMasq, containerIPV4, containerIPV6, args.IfName, conf.PrevResult)
 	if err != nil {
 		return err
 	}
