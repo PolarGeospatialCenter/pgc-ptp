@@ -20,12 +20,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"math"
 	"math/rand"
 	"net"
-	"os"
 	"runtime"
-	"sort"
 	"time"
 
 	"github.com/containernetworking/cni/pkg/skel"
@@ -143,84 +140,6 @@ func setupSNAT(ifName string, comment string) error {
 	if err := ipt.AppendUnique("nat", "POSTROUTING", "-o", ifName, "-j", "MASQUERADE", "-m", "comment", "--comment", comment); err != nil {
 		return err
 	}
-	return nil
-}
-
-func findFreeTable(start int) (int, error) {
-	allocatedTableIDs := make(map[int]bool)
-	// combine V4 and V6 tables
-	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
-		rules, err := netlink.RuleList(family)
-		if err != nil {
-			return -1, err
-		}
-		for _, rule := range rules {
-			allocatedTableIDs[rule.Table] = true
-		}
-	}
-	// find first slot that's available for both V4 and V6 usage
-	for i := start; i < math.MaxUint32; i++ {
-		if !allocatedTableIDs[i] {
-			return i, nil
-		}
-	}
-	return -1, fmt.Errorf("failed to find free route table")
-}
-
-func addPolicyRules(veth *net.Interface, ipc *current.IPConfig, routes []*types.Route, tableStart int) error {
-	table := -1
-
-	// depend on netlink atomicity to win races for table slots on initial route add
-	sort.Slice(routes, func(i, j int) bool {
-		return routes[i].Dst.String() < routes[j].Dst.String()
-	})
-
-	// try 10 times to write to an empty table slot
-	for i := 0; i < 10 && table == -1; i++ {
-		var err error
-		// jitter looking for an initial free table slot
-		table, err = findFreeTable(tableStart + rand.Intn(1000))
-		if err != nil {
-			return err
-		}
-
-		// add routes to the policy routing table
-		for _, route := range routes {
-			err := netlink.RouteAdd(&netlink.Route{
-				LinkIndex: veth.Index,
-				Dst:       &route.Dst,
-				Gw:        ipc.Address.IP,
-				Table:     table,
-			})
-			if err != nil {
-				table = -1
-				break
-			}
-		}
-
-		if table == -1 {
-			// failed to add routes so sleep and try again on a different table
-			wait := time.Duration(rand.Intn(int(math.Min(maxSleep,
-				baseSleep*math.Pow(2, float64(i)))))) * time.Millisecond
-			fmt.Fprintf(os.Stderr, "route table collision, retrying in %v\n", wait)
-			time.Sleep(wait)
-		}
-	}
-
-	// ensure we have a route table selected
-	if table == -1 {
-		return fmt.Errorf("failed to add routes to a free table")
-	}
-
-	// add policy route for traffic originating from a Pod
-	rule := netlink.NewRule()
-	rule.IifName = veth.Name
-	rule.Table = table
-	err := netlink.RuleAdd(rule)
-	if err != nil {
-		return fmt.Errorf("failed to add policy rule %v: %v", rule, err)
-	}
-
 	return nil
 }
 
@@ -416,12 +335,6 @@ func setupHostVeth(vethName string, hostAddrs []netlink.Addr, containerLinkLocal
 		if err != nil {
 			return fmt.Errorf("failed to add host route dst %v: %v", ipc.Address.IP, err)
 		}
-	}
-
-	// add policy rules for traffic coming in from Pods and destined for the VPC
-	err = addPolicyRules(veth, result.IPs[0], result.Routes, tableStart)
-	if err != nil {
-		return fmt.Errorf("failed to add policy rules: %v", err)
 	}
 
 	// Send a gratuitous arp for all borrowed v4 addresses
