@@ -1,8 +1,7 @@
-FROM golang:alpine
+FROM golang:stretch
 
 WORKDIR /go/src/github.com/PolarGeospatialCenter/pgcboot
 
-RUN apk add --no-cache git make curl
 RUN curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
 
 COPY Gopkg.toml Gopkg.lock Makefile ./
